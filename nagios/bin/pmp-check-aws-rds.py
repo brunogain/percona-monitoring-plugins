@@ -29,6 +29,8 @@ class RDS(object):
 
     def __init__(self, region, profile=None, identifier=None):
         """Get RDS instance details"""
+        DB_NOT_FOUND_CODE = "DBInstanceNotFound"
+
         self.region = region
         self.profile = profile
         self.identifier = identifier
@@ -43,10 +45,11 @@ class RDS(object):
         if self.identifier:
             for reg in self.regions_list:
                 try:
-                    print "BLC %s" % (reg)
                     rds = session.client('rds', region_name=reg)
                     self.info = rds.describe_db_instances(DBInstanceIdentifier=self.identifier)["DBInstances"]
                 except (ClientError) as msg:
+                    if msg.response['Error']['Code'] == DB_NOT_FOUND_CODE:
+                        raise
                     debug(msg)
                 else:
                     # Exit on the first region and identifier match
@@ -197,7 +200,7 @@ def main():
     options, _ = parser.parse_args()
 
     if options.debug:
-        boto.set_stream_logger('boto')
+        boto3.set_stream_logger('boto')
 
     rds = RDS(region=options.region, profile=options.profile, identifier=options.ident)
 
