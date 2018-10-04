@@ -13,9 +13,8 @@ import optparse
 import pprint
 import sys
 
-import boto
-import boto.rds
-import boto.ec2.cloudwatch
+import boto3
+from botocore.exceptions import ClientError
 
 # Nagios status codes
 OK = 0
@@ -34,8 +33,9 @@ class RDS(object):
         self.profile = profile
         self.identifier = identifier
 
+        session = boto3.Session(profile_name=self.profile)
         if self.region == 'all':
-            self.regions_list = [reg.name for reg in boto.rds.regions()]
+            self.regions_list = [reg.name for reg in session.Session().get_available_regions('rds')]
         else:
             self.regions_list = [self.region]
 
@@ -43,9 +43,10 @@ class RDS(object):
         if self.identifier:
             for reg in self.regions_list:
                 try:
-                    rds = boto.rds.connect_to_region(reg, profile_name=self.profile)
-                    self.info = rds.get_all_dbinstances(self.identifier)
-                except (boto.provider.ProfileNotFoundError, boto.exception.BotoServerError) as msg:
+                    print "BLC %s" % (reg)
+                    rds = session.client('rds', region_name=reg)
+                    self.info = rds.describe_db_instances(DBInstanceIdentifier=self.identifier)["DBInstances"]
+                except (ClientError) as msg:
                     debug(msg)
                 else:
                     # Exit on the first region and identifier match
@@ -64,32 +65,36 @@ class RDS(object):
         result = dict()
         for reg in self.regions_list:
             try:
-                rds = boto.rds.connect_to_region(reg, profile_name=self.profile)
-                result[reg] = rds.get_all_dbinstances()
-            except (boto.provider.ProfileNotFoundError, boto.exception.BotoServerError) as msg:
+                session = boto3.Session(profile_name=self.profile)
+                rds = session.client('rds', region_name=reg)
+                #result[reg] = rds.get_all_dbinstances()
+                result[reg] = rds.describe_db_instances()["DBInstances"]
+            except (boto3.provider.ProfileNotFoundError, boto3.exception.BotoServerError) as msg:
                 debug(msg)
 
         return result
 
     def get_metric(self, metric, start_time, end_time, step):
         """Get RDS metric from CloudWatch"""
-        cw_conn = boto.ec2.cloudwatch.connect_to_region(self.region, profile_name=self.profile)
+        session = boto3.Session(profile_name=self.profile)
+        cw_conn = session.client('cloudwatch',region_name=self.region)
         result = cw_conn.get_metric_statistics(
-            step,
-            start_time,
-            end_time,
-            metric,
-            'AWS/RDS',
-            'Average',
-            dimensions={'DBInstanceIdentifier': [self.identifier]}
+            Period=step,
+            StartTime=start_time,
+            EndTime=end_time,
+            MetricName=metric,
+            Namespace='AWS/RDS',
+            Statistics=['Average'],
+            Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': self.identifier}]
         )
-        if result:
-            if len(result) > 1:
+        datapoints = result["Datapoints"]
+        if datapoints:
+            if len(datapoints) > 1:
                 # Get the last point
-                result = sorted(result, key=lambda k: k['Timestamp'])
-                result.reverse()
+                datapoints = sorted(datapoints, key=lambda k: k['Timestamp'])
+                datapoints.reverse()
 
-            result = float('%.2f' % result[0]['Average'])
+            result = float('%.2f' % datapoints[0]['Average'])
 
         return result
 
@@ -125,11 +130,17 @@ def main():
         'db.m4.2xlarge': 32,
         'db.m4.4xlarge': 64,
         'db.m4.10xlarge': 160,
-        'db.r3.large': 15,
+        'db.m4.16xlarge': 256,
+	'db.r3.large': 15,
         'db.r3.xlarge': 30.5,
         'db.r3.2xlarge': 61,
         'db.r3.4xlarge': 122,
         'db.r3.8xlarge': 244,
+	'db.r4.large': 15,
+        'db.r4.xlarge': 30.5,
+        'db.r4.2xlarge': 61,
+        'db.r4.4xlarge': 122,
+        'db.r4.8xlarge': 244,
         'db.t2.micro': 1,
         'db.t2.small': 2,
         'db.t2.medium': 4,
@@ -149,7 +160,10 @@ def main():
         'status': 'RDS availability',
         'load': 'CPUUtilization',
         'memory': 'FreeableMemory',
-        'storage': 'FreeStorageSpace'
+        'storage': 'FreeStorageSpace',
+	'dbconnections': 'DatabaseConnections',
+	'readthr': 'ReadThroughput',
+	'writethr': 'WriteThroughput',
     }
 
     units = ('percent', 'GB')
@@ -237,11 +251,11 @@ def main():
         else:
             status = OK
             try:
-                version = info.EngineVersion
+                version = info["EngineVersion"]
             except:
-                version = info.engine_version
+                version = info["engine_version"]
 
-            note = '%s %s. Status: %s' % (info.engine, version, info.status)
+            note = '%s %s. Status: %s' % (info["Engine"], version, info["DBInstanceStatus"])
 
     # RDS Load Average
     elif options.metric == 'load':
@@ -296,7 +310,83 @@ def main():
 
             note = 'Load average: %s%%' % '%, '.join(loads)
             perf_data = ' '.join(perf_data)
+    # RDS DatabaseConnections
+    elif options.metric == 'dbconnections':
+        # Check thresholds
+        try:
+            warn = int(options.warn)
+            crit = int(options.crit)
+        except:
+            parser.error('Warning and critical thresholds should be integers.')
 
+        if crit < warn:
+            parser.error('Parameter inconsistency: warning threshold is greater than critical.')
+
+        if options.unit not in units:
+            parser.print_help()
+            parser.error('Unit is not valid.')
+
+        info = rds.get_info()
+        free = rds.get_metric(metrics[options.metric], now - datetime.timedelta(seconds=options.time * 60),
+                              now, options.avg * 60)
+        #parser.error(free);
+	if not info or not free:
+            status = UNKNOWN
+            note = 'Unable to get RDS details and statistics'
+        else:
+            if options.metric == 'dbconnections':
+                connections = int(free)
+
+            # Compare thresholds
+            if connections >= crit:
+                status = CRITICAL
+            elif connections >= warn:
+                status = WARNING
+
+            if status is None:
+                status = OK
+            
+	    note = 'Number of %s: %s Connections' % (options.metric, connections)
+            perf_data = 'number_%s=%s;%s;%s;0' % (options.metric, connections, warn, crit)
+    # RDS ReadIOPS
+    elif options.metric == 'readthr':
+        # Check thresholds
+        try:
+            warn = float(options.warn)
+            crit = float(options.crit)
+        except:
+            parser.error('Warning and critical thresholds should be integers.')
+
+        if crit < warn:
+            parser.error('Parameter inconsistency: warning threshold is greater than critical.')
+
+        if options.unit not in units:
+            parser.print_help()
+            parser.error('Unit is not valid.')
+
+        info = rds.get_info()
+	free = rds.get_metric(metrics[options.metric], now - datetime.timedelta(seconds=options.time * 60),
+                              now, options.avg * 60)
+        #pprint.pprint(metrics[options.metric])
+	#parser.error(info);
+        if not info or not free:
+            status = UNKNOWN
+            note = 'Unable to get RDS details and statistics'
+        else:
+            if options.metric == 'readthr':
+                iops = float(free)
+
+            # Compare thresholds
+            if iops >= crit:
+                status = CRITICAL
+            elif iops >= warn:
+                status = WARNING
+
+            if status is None:
+                status = OK
+
+            note = 'Number of %s: %s IOPS' % (options.metric, connections)
+            perf_data = 'number_%s=%s;%s;%s;0' % (options.metric, connections, warn, crit)
     # RDS Free Storage
     # RDS Free Memory
     elif options.metric in ['storage', 'memory']:
@@ -322,12 +412,12 @@ def main():
             note = 'Unable to get RDS details and statistics'
         else:
             if options.metric == 'storage':
-                storage = float(info.allocated_storage)
+                storage = float(info["AllocatedStorage"])
             elif options.metric == 'memory':
                 try:
-                    storage = db_classes[info.instance_class]
+                    storage = db_classes[info["DBInstanceClass"]]
                 except:
-                    print 'Unknown DB instance class "%s"' % info.instance_class
+                    print 'Unknown DB instance class "%s"' % info["DBInstanceClass"]
                     sys.exit(CRITICAL)
 
             free = '%.2f' % (free / 1024 ** 3)
